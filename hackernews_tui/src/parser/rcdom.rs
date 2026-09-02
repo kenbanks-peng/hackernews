@@ -44,10 +44,9 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::default::Default;
 use std::fmt;
-use std::io;
 
 use std::rc::{Rc, Weak};
 
@@ -55,9 +54,6 @@ use tendril::StrTendril;
 
 use markup5ever::interface::tree_builder;
 use markup5ever::interface::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use markup5ever::serialize::TraversalScope;
-use markup5ever::serialize::TraversalScope::{ChildrenOnly, IncludeNode};
-use markup5ever::serialize::{Serialize, Serializer};
 use markup5ever::Attribute;
 use markup5ever::ExpandedName;
 use markup5ever::QualName;
@@ -72,17 +68,13 @@ pub enum NodeData {
     /// [document type declaration on wikipedia][dtd wiki].
     ///
     /// [dtd wiki]: https://en.wikipedia.org/wiki/Document_type_declaration
-    Doctype {
-        name: StrTendril,
-        _public_id: StrTendril,
-        _system_id: StrTendril,
-    },
+    Doctype,
 
     /// A text node.
     Text { contents: RefCell<StrTendril> },
 
     /// A comment.
-    Comment { contents: StrTendril },
+    Comment,
 
     /// An element with attributes.
     Element {
@@ -101,10 +93,7 @@ pub enum NodeData {
     },
 
     /// A Processing instruction.
-    ProcessingInstruction {
-        target: StrTendril,
-        contents: StrTendril,
-    },
+    ProcessingInstruction,
 }
 
 /// A DOM node.
@@ -285,15 +274,12 @@ impl TreeSink for RcDom {
         })
     }
 
-    fn create_comment(&mut self, text: StrTendril) -> Handle {
-        Node::new(NodeData::Comment { contents: text })
+    fn create_comment(&mut self, _text: StrTendril) -> Handle {
+        Node::new(NodeData::Comment)
     }
 
-    fn create_pi(&mut self, target: StrTendril, data: StrTendril) -> Handle {
-        Node::new(NodeData::ProcessingInstruction {
-            target,
-            contents: data,
-        })
+    fn create_pi(&mut self, _target: StrTendril, _data: StrTendril) -> Handle {
+        Node::new(NodeData::ProcessingInstruction)
     }
 
     fn append(&mut self, parent: &Handle, child: NodeOrText<Handle>) {
@@ -371,18 +357,11 @@ impl TreeSink for RcDom {
 
     fn append_doctype_to_document(
         &mut self,
-        name: StrTendril,
-        public_id: StrTendril,
-        system_id: StrTendril,
+        _name: StrTendril,
+        _public_id: StrTendril,
+        _system_id: StrTendril,
     ) {
-        append(
-            &self.document,
-            Node::new(NodeData::Doctype {
-                name,
-                _public_id: public_id,
-                _system_id: system_id,
-            }),
-        );
+        append(&self.document, Node::new(NodeData::Doctype));
     }
 
     fn add_attrs_if_missing(&mut self, target: &Handle, attrs: Vec<Attribute>) {
@@ -440,80 +419,5 @@ impl Default for RcDom {
             errors: vec![],
             quirks_mode: tree_builder::NoQuirks,
         }
-    }
-}
-
-enum SerializeOp {
-    Open(Handle),
-    Close(QualName),
-}
-
-pub struct SerializableHandle(Handle);
-
-impl From<Handle> for SerializableHandle {
-    fn from(h: Handle) -> SerializableHandle {
-        SerializableHandle(h)
-    }
-}
-
-impl Serialize for SerializableHandle {
-    fn serialize<S>(&self, serializer: &mut S, traversal_scope: TraversalScope) -> io::Result<()>
-    where
-        S: Serializer,
-    {
-        let mut ops = VecDeque::new();
-        match traversal_scope {
-            IncludeNode => ops.push_back(SerializeOp::Open(self.0.clone())),
-            ChildrenOnly(_) => ops.extend(
-                self.0
-                    .children
-                    .borrow()
-                    .iter()
-                    .map(|h| SerializeOp::Open(h.clone())),
-            ),
-        }
-
-        while let Some(op) = ops.pop_front() {
-            match op {
-                SerializeOp::Open(handle) => match handle.data {
-                    NodeData::Element {
-                        ref name,
-                        ref attrs,
-                        ..
-                    } => {
-                        serializer.start_elem(
-                            name.clone(),
-                            attrs.borrow().iter().map(|at| (&at.name, &at.value[..])),
-                        )?;
-
-                        ops.reserve(1 + handle.children.borrow().len());
-                        ops.push_front(SerializeOp::Close(name.clone()));
-
-                        for child in handle.children.borrow().iter().rev() {
-                            ops.push_front(SerializeOp::Open(child.clone()));
-                        }
-                    }
-
-                    NodeData::Doctype { ref name, .. } => serializer.write_doctype(name)?,
-
-                    NodeData::Text { ref contents } => serializer.write_text(&contents.borrow())?,
-
-                    NodeData::Comment { ref contents } => serializer.write_comment(contents)?,
-
-                    NodeData::ProcessingInstruction {
-                        ref target,
-                        ref contents,
-                    } => serializer.write_processing_instruction(target, contents)?,
-
-                    NodeData::Document => panic!("Can't serialize Document node itself"),
-                },
-
-                SerializeOp::Close(name) => {
-                    serializer.end_elem(name)?;
-                }
-            }
-        }
-
-        Ok(())
     }
 }

@@ -28,9 +28,12 @@ pub fn expand_config_parsers(input: DeriveInput) -> syn::Result<TokenStream> {
     Ok(quote! {
         #[automatically_derived]
         impl config_parser2::ConfigParser for #st_name {
-            fn parse(&mut self, value: toml::Value) -> Result<()> {
-                if let toml::Value::Table(table) = value {
-                    let result: Result<Vec<_>> = table.into_iter().map(|(key, value)| {
+            fn parse(
+                &mut self,
+                value: config_parser2::toml::Value,
+            ) -> config_parser2::Result<()> {
+                if let config_parser2::toml::Value::Table(table) = value {
+                    let result: config_parser2::Result<Vec<_>> = table.into_iter().map(|(key, value)| {
                         match key.as_str() {
                             #parsers
                             _ => Ok(()),
@@ -41,7 +44,7 @@ pub fn expand_config_parsers(input: DeriveInput) -> syn::Result<TokenStream> {
                         Ok(_) => Ok(()),
                     }
                 } else {
-                    Err(anyhow::anyhow!("config parsing error: expect TOML::Value::Table for {}", #st_name_str))
+                    Err(config_parser2::__private::anyhow::anyhow!("config parsing error: expect TOML::Value::Table for {}", #st_name_str))
                 }
             }
         }

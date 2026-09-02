@@ -1,4 +1,10 @@
 pub use anyhow::Result;
+pub use toml;
+
+#[doc(hidden)]
+pub mod __private {
+    pub use anyhow;
+}
 
 pub trait ConfigParser {
     fn parse(&mut self, value: toml::Value) -> Result<()>;
@@ -11,7 +17,10 @@ macro_rules! config_parser_impl {
     ($($t:ty),+) => {
         $(
             impl ConfigParser for $t {
-                fn parse(&mut self, value: toml::Value) -> Result<()> {
+                fn parse(
+                    &mut self,
+                    value: $crate::toml::Value,
+                ) -> $crate::Result<()> {
                     *self = value.try_into::<$t>()?;
                     Ok(())
                 }
