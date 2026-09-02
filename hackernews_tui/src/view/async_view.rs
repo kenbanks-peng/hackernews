@@ -1,4 +1,4 @@
-use super::{article_view, comment_view, result_view::ResultView, story_view};
+use super::{article_view, comment_view, result_view::ResultView};
 use crate::client;
 use crate::prelude::*;
 use anyhow::Context;
@@ -18,35 +18,6 @@ pub fn construct_comment_view_async(
             )
         }
     })
-    .with_animation_fn(animation)
-    .align_center()
-    .full_screen()
-}
-
-pub fn construct_story_view_async(
-    siv: &mut Cursive,
-    client: &'static client::HNClient,
-    tag: &'static str,
-    sort_mode: client::StorySortMode,
-    page: usize,
-    numeric_filters: client::StoryNumericFilters,
-) -> impl View {
-    AsyncView::new_with_bg_creator(
-        siv,
-        move || Ok(client.get_stories_by_tag(tag, sort_mode, page, numeric_filters)),
-        move |result| {
-            ResultView::new(
-                result.with_context(|| {
-                    format!(
-                        "failed to get stories (tag={tag}, sort_mode={sort_mode:?}, page={page}, numeric_filters={{{numeric_filters}}})",
-                    )
-                }),
-                |stories| {
-                    story_view::construct_story_view(stories, client, tag, sort_mode, page, numeric_filters)
-                },
-            )
-        },
-    )
     .with_animation_fn(animation)
     .align_center()
     .full_screen()

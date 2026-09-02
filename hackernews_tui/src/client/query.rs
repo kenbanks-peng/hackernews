@@ -87,6 +87,16 @@ pub struct StoryNumericFilters {
 }
 
 impl StoryNumericFilters {
+    /// Ensure the points filter has at least the given lower bound.
+    pub fn with_min_points(mut self, min_points: u32) -> Self {
+        self.points_interval.start = Some(
+            self.points_interval
+                .start
+                .map_or(min_points, |start| start.max(min_points)),
+        );
+        self
+    }
+
     fn from_elapsed_days_to_unix_time(elapsed_days: Option<u32>) -> Option<u64> {
         match elapsed_days {
             None => None,
@@ -134,5 +144,50 @@ impl StoryNumericFilters {
 impl std::fmt::Display for StoryNumericFilters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.desc())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimum_points_is_added_to_an_empty_filter() {
+        assert_eq!(
+            StoryNumericFilters::default().with_min_points(500).query(),
+            "&numericFilters=points>=500"
+        );
+    }
+
+    #[test]
+    fn minimum_points_raises_a_lower_existing_bound() {
+        let filters = StoryNumericFilters {
+            points_interval: FilterInterval {
+                start: Some(100),
+                end: None,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.with_min_points(500).query(),
+            "&numericFilters=points>=500"
+        );
+    }
+
+    #[test]
+    fn minimum_points_preserves_a_higher_existing_bound() {
+        let filters = StoryNumericFilters {
+            points_interval: FilterInterval {
+                start: Some(750),
+                end: None,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            filters.with_min_points(500).query(),
+            "&numericFilters=points>=750"
+        );
     }
 }

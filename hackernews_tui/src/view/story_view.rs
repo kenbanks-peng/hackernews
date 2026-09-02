@@ -1,6 +1,4 @@
-use super::{
-    article_view, async_view, comment_view, help_view::HasHelpView, text_view, traits::*, utils,
-};
+use super::{article_view, comment_view, help_view::HasHelpView, text_view, traits::*, utils};
 use crate::client::StoryNumericFilters;
 use crate::prelude::*;
 
@@ -13,10 +11,18 @@ pub struct StoryView {
 
     view: ScrollView<LinearLayout>,
     raw_command: String,
+    starting_id: usize,
+    story_receiver: Option<std::sync::mpsc::Receiver<Story>>,
+    has_placeholder: bool,
 }
 
 impl ViewWrapper for StoryView {
     wrap_impl!(self.view: ScrollView<LinearLayout>);
+
+    fn wrap_layout(&mut self, size: Vec2) {
+        self.try_append_story();
+        self.view.layout(size);
+    }
 }
 
 impl StoryView {
@@ -25,38 +31,104 @@ impl StoryView {
             view: Self::construct_story_view(&stories, starting_id),
             stories,
             raw_command: String::new(),
+            starting_id,
+            story_receiver: None,
+            has_placeholder: false,
         }
     }
 
-    fn construct_story_view(stories: &[Story], starting_id: usize) -> ScrollView<LinearLayout> {
-        // Determine the maximum length of a story's ID.
-        // This maximum length is used to align the display of the story IDs.
-        let max_id_len = {
-            let max_id = starting_id + stories.len() + 1;
-            let mut width = 0;
-            let mut pw = 1;
-            while pw <= max_id {
-                pw *= 10;
-                width += 1;
-            }
+    pub fn new_streaming(
+        starting_id: usize,
+        story_receiver: std::sync::mpsc::Receiver<Story>,
+    ) -> Self {
+        StoryView {
+            view: LinearLayout::vertical()
+                .child(text_view::TextView::new(
+                    "Scanning for stories with 500+ points…",
+                ))
+                .scrollable(),
+            stories: vec![],
+            raw_command: String::new(),
+            starting_id,
+            story_receiver: Some(story_receiver),
+            has_placeholder: true,
+        }
+    }
 
-            width
-        };
+    fn max_id_len(starting_id: usize) -> usize {
+        (starting_id + client::STORY_LIMIT).to_string().len()
+    }
+
+    fn construct_story_item(story: &Story, id: usize, max_id_len: usize) -> text_view::TextView {
+        let mut story_text = StyledString::styled(
+            format!("{1:>0$}. ", max_id_len, id),
+            config::get_config_theme().component_style.metadata,
+        );
+        story_text.append(Self::get_story_text(max_id_len, story));
+        text_view::TextView::new(story_text)
+    }
+
+    fn construct_story_view(stories: &[Story], starting_id: usize) -> ScrollView<LinearLayout> {
+        let max_id_len = Self::max_id_len(starting_id);
 
         LinearLayout::vertical()
-            .with(|s| {
+            .with(|view| {
                 stories.iter().enumerate().for_each(|(i, story)| {
-                    // initialize the story text with its ID
-                    let mut story_text = StyledString::styled(
-                        format!("{1:>0$}. ", max_id_len, starting_id + i + 1),
-                        config::get_config_theme().component_style.metadata,
-                    );
-                    story_text.append(Self::get_story_text(max_id_len, story));
-
-                    s.add_child(text_view::TextView::new(story_text));
+                    view.add_child(Self::construct_story_item(
+                        story,
+                        starting_id + i + 1,
+                        max_id_len,
+                    ));
                 })
             })
             .scrollable()
+    }
+
+    /// Append downloaded stories without replacing the view or disturbing its focus.
+    fn try_append_story(&mut self) {
+        let mut downloaded_stories = vec![];
+        let mut disconnected = false;
+        if let Some(receiver) = &self.story_receiver {
+            loop {
+                match receiver.try_recv() {
+                    Ok(story) => downloaded_stories.push(story),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if disconnected {
+            self.story_receiver = None;
+            if self.stories.is_empty() && downloaded_stories.is_empty() {
+                if let Some(view) = self
+                    .get_item_mut(0)
+                    .and_then(|view| view.downcast_mut::<text_view::TextView>())
+                {
+                    view.set_content("No stories with 500+ points on this page.");
+                }
+            }
+        }
+        if downloaded_stories.is_empty() {
+            return;
+        }
+
+        if self.has_placeholder {
+            self.get_inner_list_mut().remove_child(0);
+            self.has_placeholder = false;
+        }
+        for story in downloaded_stories {
+            let id = self.starting_id + self.stories.len() + 1;
+            self.add_item(Self::construct_story_item(
+                &story,
+                id,
+                Self::max_id_len(self.starting_id),
+            ));
+            self.stories.push(story);
+        }
     }
 
     /// Get the text summarizing basic information about a story
@@ -128,12 +200,20 @@ pub fn construct_story_main_view(
     client: &'static client::HNClient,
     starting_id: usize,
 ) -> OnEventView<StoryView> {
+    construct_story_main_view_from(StoryView::new(stories, starting_id), client, starting_id)
+}
+
+fn construct_story_main_view_from(
+    story_view: StoryView,
+    client: &'static client::HNClient,
+    starting_id: usize,
+) -> OnEventView<StoryView> {
     let is_suffix_key =
         |c: &Event| -> bool { config::get_story_view_keymap().goto_story.has_event(c) };
 
     let story_view_keymap = config::get_story_view_keymap().clone();
 
-    OnEventView::new(StoryView::new(stories, starting_id))
+    OnEventView::new(story_view)
         // number parsing
         .on_pre_event_inner(EventTrigger::from_fn(|_| true), move |s, e| {
             match *e {
@@ -153,6 +233,9 @@ pub fn construct_story_main_view(
         })
         // story navigation shortcuts
         .on_pre_event_inner(story_view_keymap.prev_story, |s, _| {
+            if s.stories.is_empty() {
+                return None;
+            }
             let id = s.get_focus_index();
             if id == 0 {
                 None
@@ -161,6 +244,9 @@ pub fn construct_story_main_view(
             }
         })
         .on_pre_event_inner(story_view_keymap.next_story, |s, _| {
+            if s.stories.is_empty() {
+                return None;
+            }
             let id = s.get_focus_index();
             s.set_focus_index(id + 1)
         })
@@ -168,7 +254,7 @@ pub fn construct_story_main_view(
             let id = s.get_focus_index();
             // the story struct hasn't had any comments inside yet,
             // so it can be cloned without greatly affecting performance
-            let item_id = s.stories[id].id;
+            let item_id = s.stories.get(id)?.id;
             Some(EventResult::with_cb({
                 move |s| comment_view::construct_and_add_new_comment_view(s, client, item_id, false)
             }))
@@ -176,14 +262,14 @@ pub fn construct_story_main_view(
         // open external link shortcuts
         .on_pre_event_inner(story_view_keymap.open_article_in_browser, move |s, _| {
             let id = s.get_focus_index();
-            utils::open_url_in_browser(s.stories[id].get_url().as_ref());
+            utils::open_url_in_browser(s.stories.get(id)?.get_url().as_ref());
             Some(EventResult::Consumed(None))
         })
         .on_pre_event_inner(
             story_view_keymap.open_article_in_article_view,
             move |s, _| {
                 let id = s.get_focus_index();
-                let url = s.stories[id].url.clone();
+                let url = s.stories.get(id)?.url.clone();
                 if !url.is_empty() {
                     Some(EventResult::with_cb({
                         move |s| article_view::construct_and_add_new_article_view(client, s, &url)
@@ -194,7 +280,7 @@ pub fn construct_story_main_view(
             },
         )
         .on_pre_event_inner(story_view_keymap.open_story_in_browser, move |s, _| {
-            let url = s.stories[s.get_focus_index()].story_url();
+            let url = s.stories.get(s.get_focus_index())?.story_url();
             utils::open_url_in_browser(&url);
             Some(EventResult::Consumed(None))
         })
@@ -227,7 +313,7 @@ fn get_story_view_title_bar(tag: &'static str, sort_mode: client::StorySortMode)
             config::get_config_theme().palette.light_white,
         )),
     );
-    title.append_styled(" Hacker News", style);
+    title.append_styled(" Hacker News (500+ points)", style);
 
     for (i, item) in STORY_TAGS.iter().enumerate() {
         title.append_styled(" | ", style);
@@ -267,11 +353,27 @@ pub fn construct_story_view(
     numeric_filters: client::StoryNumericFilters,
 ) -> impl View {
     let starting_id = client::STORY_LIMIT * page;
-    let main_view = construct_story_main_view(stories, client, starting_id).full_height();
+    construct_story_view_from_main(
+        construct_story_main_view(stories, client, starting_id),
+        client,
+        tag,
+        sort_mode,
+        page,
+        numeric_filters,
+    )
+}
 
+fn construct_story_view_from_main(
+    main_view: OnEventView<StoryView>,
+    client: &'static client::HNClient,
+    tag: &'static str,
+    sort_mode: client::StorySortMode,
+    page: usize,
+    numeric_filters: client::StoryNumericFilters,
+) -> impl View {
     let mut view = LinearLayout::vertical()
         .child(get_story_view_title_bar(tag, sort_mode))
-        .child(main_view)
+        .child(main_view.full_height())
         .child(utils::construct_footer_view::<StoryView>());
     view.set_focus_index(1)
         .unwrap_or(EventResult::Consumed(None));
@@ -376,10 +478,37 @@ pub fn construct_and_add_new_story_view(
     numeric_filters: client::StoryNumericFilters,
     pop_layer: bool,
 ) {
-    let async_view =
-        async_view::construct_story_view_async(s, client, tag, sort_mode, page, numeric_filters);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let cb_sink = s.cb_sink().clone();
+
+    std::thread::spawn(move || {
+        let result = client.stream_stories_by_tag(tag, sort_mode, page, numeric_filters, |story| {
+            if sender.send(story).is_err() {
+                return false;
+            }
+            cb_sink.send(Box::new(|_| {})).is_ok()
+        });
+        if let Err(err) = result {
+            warn!(
+                "failed to scan stories (tag={tag}, sort_mode={sort_mode:?}, page={page}): {err}"
+            );
+        }
+        // Wake the renderer once more so it observes channel disconnection and
+        // can replace the scanning placeholder when no stories were found.
+        let _ = cb_sink.send(Box::new(|_| {}));
+    });
+
+    let starting_id = client::STORY_LIMIT * page;
+    let main_view = construct_story_main_view_from(
+        StoryView::new_streaming(starting_id, receiver),
+        client,
+        starting_id,
+    );
+    let story_view =
+        construct_story_view_from_main(main_view, client, tag, sort_mode, page, numeric_filters);
+
     if pop_layer {
         s.pop_layer();
     }
-    s.screen_mut().add_transparent_layer(Layer::new(async_view));
+    s.screen_mut().add_transparent_layer(Layer::new(story_view));
 }

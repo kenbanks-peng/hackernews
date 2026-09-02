@@ -20,6 +20,7 @@ const HN_SEARCH_QUERY_STRING: &str =
 pub const HN_HOST_URL: &str = "https://news.ycombinator.com";
 pub const STORY_LIMIT: usize = 20;
 pub const SEARCH_LIMIT: usize = 15;
+pub const MIN_STORY_POINTS: u32 = 500;
 
 static CLIENT: once_cell::sync::OnceCell<HNClient> = once_cell::sync::OnceCell::new();
 
@@ -233,6 +234,7 @@ impl HNClient {
             self.client
                 .get(&request_url)
                 .query("query", query)
+                .query("numericFilters", &format!("points>={MIN_STORY_POINTS}"))
                 .call()?
                 .into_json::<StoriesResponse>()?,
             format!(
@@ -240,7 +242,10 @@ impl HNClient {
             )
         );
 
-        Ok(response.into())
+        Ok(<Vec<Story>>::from(response)
+            .into_iter()
+            .filter(|story| story.points >= MIN_STORY_POINTS)
+            .collect())
     }
 
     /// Reorder a list of stories to follow the same order as another list of story IDs.
@@ -269,39 +274,34 @@ impl HNClient {
         stories
     }
 
-    /// Retrieve a list of story IDs given a story tag using the HN Official API
-    /// then compose a HN Algolia API to retrieve the corresponding stories' data.
-    fn get_stories_no_sort(
-        &self,
-        tag: &str,
-        page: usize,
-        numeric_filters: query::StoryNumericFilters,
-    ) -> Result<Vec<Story>> {
-        // get the HN official API's endpoint based on query's story tag
+    /// Retrieve story IDs in the order used by the Hacker News website.
+    fn get_story_ids_by_tag(&self, tag: &str) -> Result<Vec<u32>> {
         let endpoint = match tag {
             "front_page" => "/topstories.json",
             "ask_hn" => "/askstories.json",
             "show_hn" => "/showstories.json",
-            _ => {
-                anyhow::bail!("unsupported story tag {tag}");
-            }
+            _ => anyhow::bail!("unsupported story tag {tag}"),
         };
         let request_url = format!("{HN_OFFICIAL_PREFIX}{endpoint}");
-        let stories = log!(
+        Ok(log!(
             self.client
                 .get(&request_url)
                 .call()?
                 .into_json::<Vec<u32>>()?,
             format!("get {tag} story IDs using {request_url}")
-        );
+        ))
+    }
 
-        let start_id = STORY_LIMIT * page;
-        if start_id >= stories.len() {
+    /// Retrieve story data for an ordered slice of IDs.
+    fn get_stories_from_ids(
+        &self,
+        tag: &str,
+        ids: &[u32],
+        numeric_filters: query::StoryNumericFilters,
+    ) -> Result<Vec<Story>> {
+        if ids.is_empty() {
             return Ok(vec![]);
         }
-
-        let end_id = std::cmp::min(start_id + STORY_LIMIT, stories.len());
-        let ids = &stories[start_id..end_id];
 
         let request_url = format!(
             "{}/search?tags=story,({}){}&hitsPerPage={}",
@@ -310,18 +310,33 @@ impl HNClient {
                 "{tags}story_{story_id},"
             )),
             numeric_filters.query(),
-            STORY_LIMIT,
+            ids.len(),
         );
-
         let response = log!(
             self.client
                 .get(&request_url)
                 .call()?
                 .into_json::<StoriesResponse>()?,
-            format!("get stories (tag={tag}, page={page}) using {request_url}",)
+            format!("get stories (tag={tag}) using {request_url}")
         );
 
         Ok(self.reorder_stories_based_on_ids(response.into(), ids))
+    }
+
+    /// Retrieve one source page of stories in Hacker News website order.
+    fn get_stories_no_sort(
+        &self,
+        tag: &str,
+        page: usize,
+        numeric_filters: query::StoryNumericFilters,
+    ) -> Result<Vec<Story>> {
+        let ids = self.get_story_ids_by_tag(tag)?;
+        let start_id = STORY_LIMIT * page;
+        if start_id >= ids.len() {
+            return Ok(vec![]);
+        }
+        let end_id = std::cmp::min(start_id + STORY_LIMIT, ids.len());
+        self.get_stories_from_ids(tag, &ids[start_id..end_id], numeric_filters)
     }
 
     /// Get a list of stories filtering on a specific tag.
@@ -335,6 +350,7 @@ impl HNClient {
         page: usize,
         numeric_filters: query::StoryNumericFilters,
     ) -> Result<Vec<Story>> {
+        let numeric_filters = numeric_filters.with_min_points(MIN_STORY_POINTS);
         let search_op = match sort_mode {
             StorySortMode::None => {
                 return self.get_stories_no_sort(tag, page, numeric_filters);
@@ -368,7 +384,60 @@ impl HNClient {
             )
         );
 
-        Ok(response.into())
+        Ok(<Vec<Story>>::from(response)
+            .into_iter()
+            .filter(|story| story.points >= MIN_STORY_POINTS)
+            .collect())
+    }
+
+    /// Scan for one display page of qualifying stories and emit each story as
+    /// soon as it is available. Returning `false` from `on_story` cancels the scan.
+    pub fn stream_stories_by_tag<F>(
+        &self,
+        tag: &str,
+        sort_mode: StorySortMode,
+        page: usize,
+        numeric_filters: query::StoryNumericFilters,
+        mut on_story: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Story) -> bool,
+    {
+        let numeric_filters = numeric_filters.with_min_points(MIN_STORY_POINTS);
+
+        if sort_mode != StorySortMode::None {
+            for story in self.get_stories_by_tag(tag, sort_mode, page, numeric_filters)? {
+                if !on_story(story) {
+                    break;
+                }
+            }
+            return Ok(());
+        }
+
+        let ids = self.get_story_ids_by_tag(tag)?;
+        let page_start = page * STORY_LIMIT;
+        let mut qualifying_stories = 0;
+        let mut emitted_stories = 0;
+
+        for ids in ids.chunks(STORY_LIMIT) {
+            for story in self.get_stories_from_ids(tag, ids, numeric_filters)? {
+                if story.points < MIN_STORY_POINTS {
+                    continue;
+                }
+                if qualifying_stories >= page_start {
+                    if !on_story(story) {
+                        return Ok(());
+                    }
+                    emitted_stories += 1;
+                    if emitted_stories == STORY_LIMIT {
+                        return Ok(());
+                    }
+                }
+                qualifying_stories += 1;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn get_article(&self, url: &str) -> Result<Article> {

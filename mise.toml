@@ -1,3 +1,8 @@
 [tasks.build-production]
 description = "Build the production binary"
 run = "cargo build --release"
+
+[tasks.deploy]
+description = "Build and install hackernews_tui to ~/.local/bin"
+depends = ["build-production"]
+run = "mkdir -p ~/.local/bin && cp target/release/hackernews_tui ~/.local/bin/hackernews_tui"
